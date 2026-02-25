@@ -87,11 +87,24 @@ def _convert_to_gemini_parts(contents: List[Dict[str, Any]]) -> List[types.Part]
             gemini_parts.append(types.Part.from_text(text=item["text"]))
         elif item.get("type") == "image":
             source = item.get("source", {})
+            # Supports both:
+            # 1) {"type":"image", "source": {"type":"base64","media_type":"image/jpeg","data":"..."}}
+            # 2) {"type":"image", "image_base64":"..."} (legacy in this repo)
             if source.get("type") == "base64":
+                media_type = source.get("media_type", "image/jpeg")
+                data_b64 = source.get("data", "")
+                if data_b64:
+                    gemini_parts.append(
+                        types.Part.from_bytes(
+                            data=base64.b64decode(data_b64),
+                            mime_type=media_type,
+                        )
+                    )
+            elif item.get("image_base64"):
                 gemini_parts.append(
                     types.Part.from_bytes(
-                        data=base64.b64decode(source["data"]),
-                        mime_type=source["media_type"],
+                        data=base64.b64decode(item["image_base64"]),
+                        mime_type="image/jpeg",
                     )
                 )
     return gemini_parts

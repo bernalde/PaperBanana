@@ -12,3 +12,6 @@ matplotlib
 python-dotenv
 pyyaml
 google-auth
+pypdf
+python-docx
+docling

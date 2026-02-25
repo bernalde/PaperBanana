@@ -76,7 +76,7 @@ The easiest way to launch PaperBanana is via the interactive Streamlit demo:
 streamlit run demo.py
 ```
 
-The web interface provides two main workflows:
+The web interface provides three main workflows:
 
 **1. Generate Candidates Tab**:
 - Paste your method section content (Markdown recommended) and provide the figure caption.
@@ -89,6 +89,13 @@ The web interface provides two main workflows:
 - Describe desired changes or request upscaling.
 - Select resolution (2K/4K) and aspect ratio.
 - Download the refined high-resolution output.
+
+**3. Paper Upload Tab**:
+- Upload a paper file (`.pdf` or `.docx`) and convert it to markdown text.
+- Auto-discover candidate figure briefs from ranked method-related sections.
+- Review/edit each brief and explicitly approve the ones to generate.
+- Batch-generate candidates per approved brief (retrieval defaults to `none`).
+- Export run artifacts as PNGs plus reproducibility metadata JSON.
 
 #### Command-Line Interface
 You can also run PaperBanana from the command line:
@@ -244,5 +251,4 @@ If you find this repo helpful, please cite our paper as follows:
 This is not an officially supported Google product. This project is not eligible for the [Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security).
 
 Our goal is simply to benefit the community, so currently we have no plans to use it for commercial purposes. The core methodology was developed during my internship at Google, and patents have been filed for these specific workflows by Google. While this doesn't impact open-source research efforts, it restricts third-party commercial applications using similar logic.
-
 

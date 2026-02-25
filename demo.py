@@ -22,12 +22,14 @@ import streamlit as st
 import asyncio
 import base64
 import json
+import re
 from io import BytesIO
 from PIL import Image
 from pathlib import Path
 import sys
 import os
 from datetime import datetime
+from typing import Any, Dict, List
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -45,6 +47,9 @@ try:
     print("DEBUG: Imported all agents")
     from utils import config
     from utils.paperviz_processor import PaperVizProcessor
+    from utils.paper_ingest import convert_document_to_markdown
+    from utils.figure_discovery import discover_figure_briefs
+    from utils.paper_sections import extract_sections, rank_sections_for_figure_discovery
     print("DEBUG: Imported utils")
 
     import yaml
@@ -225,6 +230,164 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
         return None, f"❌ Error: {str(e)}"
 
 
+def ensure_minimal_data_tree():
+    """
+    Ensure minimal data tree exists so retrieval='none' and demo runs don't fail
+    when users have not downloaded PaperBananaBench.
+    """
+    data_root = Path(__file__).parent / "data" / "PaperBananaBench"
+    for task in ("diagram", "plot"):
+        task_dir = data_root / task
+        task_dir.mkdir(parents=True, exist_ok=True)
+        ref_path = task_dir / "ref.json"
+        if not ref_path.exists():
+            ref_path.write_text("[]", encoding="utf-8")
+
+
+def slugify(value, max_len=80):
+    value = value.lower().strip()
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = re.sub(r"-{2,}", "-", value).strip("-")
+    if not value:
+        value = "untitled"
+    return value[:max_len].strip("-")
+
+
+def get_final_candidate_keys(result, exp_mode, task_name="diagram"):
+    """
+    Return (final_image_key, final_desc_key) for one candidate result.
+    """
+    final_image_key = None
+    final_desc_key = None
+
+    for round_idx in range(3, -1, -1):
+        image_key = f"target_{task_name}_critic_desc{round_idx}_base64_jpg"
+        if image_key in result and result[image_key]:
+            final_image_key = image_key
+            final_desc_key = f"target_{task_name}_critic_desc{round_idx}"
+            break
+
+    if not final_image_key:
+        if exp_mode == "demo_full":
+            final_image_key = f"target_{task_name}_stylist_desc0_base64_jpg"
+            final_desc_key = f"target_{task_name}_stylist_desc0"
+        else:
+            final_image_key = f"target_{task_name}_desc0_base64_jpg"
+            final_desc_key = f"target_{task_name}_desc0"
+
+    return final_image_key, final_desc_key
+
+
+async def discover_figure_briefs_async(markdown_text, paper_title, max_figures=6, model_name=""):
+    model_name = model_name or get_config_val("defaults", "model_name", "MODEL_NAME", "")
+    return await discover_figure_briefs(
+        markdown_text=markdown_text,
+        paper_title=paper_title,
+        model_name=model_name,
+        max_figures=max_figures,
+        max_sections=8,
+    )
+
+
+async def generate_candidates_for_briefs_async(
+    approved_briefs,
+    exp_mode,
+    num_candidates,
+    aspect_ratio,
+    max_critic_rounds,
+    model_name="",
+):
+    all_outputs = []
+    for brief in approved_briefs:
+        data_list = create_sample_inputs(
+            method_content=brief["source_excerpt"],
+            caption=brief["caption_final"],
+            aspect_ratio=aspect_ratio,
+            num_copies=num_candidates,
+            max_critic_rounds=max_critic_rounds,
+        )
+        for idx, item in enumerate(data_list):
+            item["filename"] = f"{slugify(brief['title'])}_candidate_{idx}"
+            item["figure_title"] = brief["title"]
+            item["source_section_title"] = brief.get("source_section_title", "")
+
+        results = await process_parallel_candidates(
+            data_list=data_list,
+            exp_mode=exp_mode,
+            retrieval_setting="none",
+            model_name=model_name,
+        )
+        all_outputs.append({"brief": brief, "results": results})
+    return all_outputs
+
+
+def persist_paper_run_outputs(
+    paper_title,
+    source_file_name,
+    approved_briefs,
+    batch_outputs,
+    generation_settings,
+):
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    paper_slug = slugify(paper_title or "paper")
+    base_dir = Path(__file__).parent / "results" / "user_papers" / paper_slug / run_timestamp
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    run_metadata = {
+        "paper_title": paper_title,
+        "source_file_name": source_file_name,
+        "run_timestamp": run_timestamp,
+        "settings": generation_settings,
+        "briefs": [],
+    }
+
+    for output_idx, item in enumerate(batch_outputs):
+        brief = item["brief"]
+        results = item["results"]
+
+        figure_slug = slugify(brief.get("title", f"figure-{output_idx + 1}"))
+        figure_dir = base_dir / f"{output_idx + 1:02d}_{figure_slug}"
+        figure_dir.mkdir(parents=True, exist_ok=True)
+
+        # Persist raw structured outputs.
+        result_json_path = figure_dir / "results.json"
+        with open(result_json_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+
+        candidate_png_paths = []
+        for candidate_id, result in enumerate(results):
+            final_image_key, _ = get_final_candidate_keys(
+                result=result,
+                exp_mode=generation_settings.get("exp_mode", "demo_planner_critic"),
+                task_name="diagram",
+            )
+            if not final_image_key:
+                continue
+            img = base64_to_image(result.get(final_image_key))
+            if img is None:
+                continue
+            candidate_png = figure_dir / f"candidate_{candidate_id}.png"
+            img.save(candidate_png, format="PNG")
+            candidate_png_paths.append(str(candidate_png.relative_to(base_dir)))
+
+        run_metadata["briefs"].append(
+            {
+                "brief_id": brief.get("brief_id", f"brief_{output_idx + 1}"),
+                "title": brief.get("title", ""),
+                "source_section_title": brief.get("source_section_title", ""),
+                "caption_final": brief.get("caption_final", ""),
+                "result_json": str(result_json_path.relative_to(base_dir)),
+                "candidate_png_paths": candidate_png_paths,
+            }
+        )
+
+    metadata_path = base_dir / "generation_metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(run_metadata, f, ensure_ascii=False, indent=2)
+
+    return base_dir, metadata_path
+
+
 def get_evolution_stages(result, exp_mode):
     """Extract all evolution stages (images and descriptions) from the result."""
     task_name = "diagram"
@@ -270,33 +433,15 @@ def get_evolution_stages(result, exp_mode):
     
     return stages
 
-def display_candidate_result(result, candidate_id, exp_mode):
+def display_candidate_result(result, candidate_id, exp_mode, key_prefix="candidate"):
     """Display a single candidate result."""
     task_name = "diagram"
     
-    # Determine which image to show based on exp_mode
-    # For demo modes, always try to find the last critic round
-    final_image_key = None
-    final_desc_key = None
-    
-    # Try to find the last critic round
-    for round_idx in range(3, -1, -1):  # Check rounds 3, 2, 1, 0
-        image_key = f"target_{task_name}_critic_desc{round_idx}_base64_jpg"
-        if image_key in result and result[image_key]:
-            final_image_key = image_key
-            final_desc_key = f"target_{task_name}_critic_desc{round_idx}"
-            break
-    
-    # Fallback if no critic rounds completed
-    if not final_image_key:
-        if exp_mode == "demo_full":
-            # demo_full uses stylist before visualizer
-            final_image_key = f"target_{task_name}_stylist_desc0_base64_jpg"
-            final_desc_key = f"target_{task_name}_stylist_desc0"
-        else:
-            # demo_planner_critic uses planner output
-            final_image_key = f"target_{task_name}_desc0_base64_jpg"
-            final_desc_key = f"target_{task_name}_desc0"
+    final_image_key, final_desc_key = get_final_candidate_keys(
+        result=result,
+        exp_mode=exp_mode,
+        task_name=task_name,
+    )
     
     # Display the final image
     if final_image_key and final_image_key in result:
@@ -312,7 +457,7 @@ def display_candidate_result(result, candidate_id, exp_mode):
                 data=buffered.getvalue(),
                 file_name=f"candidate_{candidate_id}.png",
                 mime="image/png",
-                key=f"download_candidate_{candidate_id}",
+                key=f"download_{key_prefix}_{candidate_id}",
                 use_container_width=True
             )
         else:
@@ -365,11 +510,12 @@ def display_candidate_result(result, candidate_id, exp_mode):
                 st.info("No description available")
 
 def main():
+    ensure_minimal_data_tree()
     st.title("🍌 PaperVizAgent Demo")
     st.markdown("AI-powered scientific diagram generation and refinement")
     
     # Create tabs
-    tab1, tab2 = st.tabs(["📊 Generate Candidates", "✨ Refine Image"])
+    tab1, tab2, tab3 = st.tabs(["📊 Generate Candidates", "✨ Refine Image", "📄 Paper Upload"])
     
     # ==================== TAB 1: Generate Candidates ====================
     with tab1:
@@ -651,23 +797,11 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                     task_name = "diagram"
                     
                     for candidate_id, result in enumerate(results):
-                        
-                        # Find the final image key (same logic as display)
-                        final_image_key = None
-                        
-                        # Try to find the last critic round
-                        for round_idx in range(3, -1, -1):
-                            image_key = f"target_{task_name}_critic_desc{round_idx}_base64_jpg"
-                            if image_key in result and result[image_key]:
-                                final_image_key = image_key
-                                break
-                        
-                        # Fallback if no critic rounds completed
-                        if not final_image_key:
-                            if current_mode == "demo_full":
-                                final_image_key = f"target_{task_name}_stylist_desc0_base64_jpg"
-                            else:
-                                final_image_key = f"target_{task_name}_desc0_base64_jpg"
+                        final_image_key, _ = get_final_candidate_keys(
+                            result=result,
+                            exp_mode=current_mode,
+                            task_name=task_name,
+                        )
                         
                         if final_image_key and final_image_key in result:
                             img = base64_to_image(result[final_image_key])
@@ -803,6 +937,298 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                         mime="image/png",
                         use_container_width=True
                     )
+
+    # ==================== TAB 3: Paper Upload ====================
+    with tab3:
+        st.markdown("### Upload a PDF/DOCX, discover figure briefs, review, and generate diagrams")
+        st.caption(
+            "Docling-first conversion with fallback extraction. "
+            "Figure generation uses retrieval='none' by default."
+        )
+
+        default_model = get_config_val("defaults", "model_name", "MODEL_NAME", "")
+
+        col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+        with col_cfg1:
+            paper_title = st.text_input(
+                "Paper Title",
+                value=st.session_state.get("paper_title", ""),
+                key="paper_title_input",
+                placeholder="My New Paper",
+            )
+        with col_cfg2:
+            max_briefs = st.number_input(
+                "Max Briefs to Discover",
+                min_value=1,
+                max_value=12,
+                value=6,
+                key="paper_max_briefs",
+            )
+        with col_cfg3:
+            paper_model_name = st.selectbox(
+                "Reasoning Model",
+                ["", default_model] if default_model else [""],
+                index=1 if default_model else 0,
+                key="paper_model_name",
+                help="Uses defaults.model_name from config when left empty.",
+            )
+
+        st.divider()
+
+        uploaded_doc = st.file_uploader(
+            "Upload Paper Document",
+            type=["pdf", "docx"],
+            key="paper_doc_upload",
+            help="Text-based PDFs and DOCX are supported. OCR is not enabled for scanned PDFs.",
+        )
+
+        if uploaded_doc is not None:
+            st.session_state["paper_title"] = paper_title or Path(uploaded_doc.name).stem
+            if st.button("📄 Convert Document to Markdown", type="primary", key="paper_convert_btn"):
+                try:
+                    upload_dir = Path(__file__).parent / "results" / "user_papers" / "_uploads"
+                    upload_dir.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    saved_name = f"{ts}_{slugify(Path(uploaded_doc.name).stem)}{Path(uploaded_doc.name).suffix.lower()}"
+                    saved_path = upload_dir / saved_name
+                    with open(saved_path, "wb") as f:
+                        f.write(uploaded_doc.getvalue())
+
+                    conversion = convert_document_to_markdown(saved_path)
+                    st.session_state["paper_source_path"] = str(saved_path)
+                    st.session_state["paper_source_name"] = uploaded_doc.name
+                    st.session_state["paper_markdown"] = conversion["markdown"]
+                    st.session_state["paper_markdown_engine"] = conversion["engine"]
+                    st.session_state["paper_markdown_warnings"] = conversion.get("warnings", [])
+                    # Reset downstream states for new document
+                    st.session_state.pop("paper_discovered_briefs", None)
+                    st.session_state.pop("paper_batch_outputs", None)
+                    st.success(f"Converted document using `{conversion['engine']}`.")
+                except Exception as e:
+                    st.error(f"Document conversion failed: {e}")
+
+        if st.session_state.get("paper_markdown"):
+            engine_name = st.session_state.get("paper_markdown_engine", "unknown")
+            st.info(f"Extraction engine: `{engine_name}`")
+            for warn in st.session_state.get("paper_markdown_warnings", []):
+                st.warning(warn)
+
+            edited_markdown = st.text_area(
+                "Extracted Markdown (editable)",
+                value=st.session_state.get("paper_markdown", ""),
+                height=320,
+                key="paper_markdown_editor",
+            )
+            st.session_state["paper_markdown"] = edited_markdown
+
+            # Quick visibility into sections used by discovery.
+            sections = extract_sections(edited_markdown)
+            ranked_sections = rank_sections_for_figure_discovery(sections, max_sections=8)
+            with st.expander("🔎 Preview Ranked Sections for Discovery", expanded=False):
+                if not ranked_sections:
+                    st.caption("No sections detected yet.")
+                else:
+                    for idx, section in enumerate(ranked_sections, start=1):
+                        st.markdown(
+                            f"**{idx}. {section['title']}** "
+                            f"(score={section['score']:.1f}, words={section['word_count']})"
+                        )
+
+            if st.button("🧠 Discover Figure Briefs", key="paper_discover_btn", use_container_width=True):
+                resolved_model_name = paper_model_name or default_model
+                if not resolved_model_name:
+                    st.error(
+                        "No reasoning model configured. Set `defaults.model_name` in "
+                        "`configs/model_config.yaml` or select a model in the UI."
+                    )
+                else:
+                    with st.spinner("Discovering candidate figure briefs..."):
+                        try:
+                            discovery_res = asyncio.run(
+                                discover_figure_briefs_async(
+                                    markdown_text=edited_markdown,
+                                    paper_title=st.session_state.get("paper_title", "Untitled Paper"),
+                                    max_figures=max_briefs,
+                                    model_name=resolved_model_name,
+                                )
+                            )
+                            st.session_state["paper_discovery_raw_response"] = discovery_res.get("raw_response", "")
+                            st.session_state["paper_discovered_briefs"] = discovery_res.get("briefs", [])
+                            st.success(
+                                f"Discovered {len(st.session_state['paper_discovered_briefs'])} candidate figure briefs."
+                            )
+                        except Exception as e:
+                            st.error(f"Figure discovery failed: {e}")
+
+        discovered_briefs = st.session_state.get("paper_discovered_briefs", [])
+        if discovered_briefs:
+            st.divider()
+            st.markdown("## ✅ Mandatory Review Before Generation")
+            st.caption("Edit each brief and explicitly approve the ones you want to generate.")
+
+            reviewed_briefs = []
+            for idx, brief in enumerate(discovered_briefs):
+                brief_key = brief.get("brief_id", f"brief_{idx + 1}")
+                with st.expander(f"{idx + 1}. {brief.get('title', 'Untitled Brief')}", expanded=False):
+                    brief_title = st.text_input(
+                        "Figure Title",
+                        value=brief.get("title", ""),
+                        key=f"{brief_key}_title",
+                    )
+                    source_section_title = st.text_input(
+                        "Source Section",
+                        value=brief.get("source_section_title", ""),
+                        key=f"{brief_key}_section",
+                    )
+                    source_excerpt = st.text_area(
+                        "Source Excerpt",
+                        value=brief.get("source_excerpt", ""),
+                        height=180,
+                        key=f"{brief_key}_excerpt",
+                    )
+                    caption_final = st.text_area(
+                        "Caption (editable final)",
+                        value=brief.get("caption_draft", ""),
+                        height=120,
+                        key=f"{brief_key}_caption",
+                    )
+                    approval = st.checkbox(
+                        "Approve this brief for generation",
+                        value=False,
+                        key=f"{brief_key}_approved",
+                    )
+
+                    reviewed_briefs.append(
+                        {
+                            "brief_id": brief_key,
+                            "title": brief_title.strip(),
+                            "source_section_title": source_section_title.strip(),
+                            "source_excerpt": source_excerpt.strip(),
+                            "caption_final": caption_final.strip(),
+                            "approved": approval,
+                        }
+                    )
+
+            st.session_state["paper_reviewed_briefs"] = reviewed_briefs
+            approved_briefs = [b for b in reviewed_briefs if b["approved"]]
+            st.info(f"Approved briefs: {len(approved_briefs)} / {len(reviewed_briefs)}")
+
+            col_g1, col_g2, col_g3, col_g4 = st.columns(4)
+            with col_g1:
+                paper_exp_mode = st.selectbox(
+                    "Pipeline Mode",
+                    ["demo_planner_critic", "demo_full"],
+                    index=0,
+                    key="paper_exp_mode",
+                )
+            with col_g2:
+                paper_num_candidates = st.number_input(
+                    "Candidates per Brief",
+                    min_value=1,
+                    max_value=10,
+                    value=4,
+                    key="paper_num_candidates",
+                )
+            with col_g3:
+                paper_aspect_ratio = st.selectbox(
+                    "Aspect Ratio",
+                    ["21:9", "16:9", "3:2"],
+                    index=1,
+                    key="paper_aspect_ratio",
+                )
+            with col_g4:
+                paper_max_critic_rounds = st.number_input(
+                    "Max Critic Rounds",
+                    min_value=1,
+                    max_value=5,
+                    value=3,
+                    key="paper_max_critic_rounds",
+                )
+
+            if st.button("🚀 Generate Approved Briefs", type="primary", key="paper_generate_btn", use_container_width=True):
+                if not approved_briefs:
+                    st.error("Approve at least one brief before generation.")
+                elif not (paper_model_name or default_model):
+                    st.error(
+                        "No reasoning model configured. Set `defaults.model_name` in "
+                        "`configs/model_config.yaml` or select a model in the UI."
+                    )
+                else:
+                    with st.spinner(
+                        f"Generating {paper_num_candidates} candidates each for {len(approved_briefs)} approved briefs..."
+                    ):
+                        try:
+                            batch_outputs = asyncio.run(
+                                generate_candidates_for_briefs_async(
+                                    approved_briefs=approved_briefs,
+                                    exp_mode=paper_exp_mode,
+                                    num_candidates=paper_num_candidates,
+                                    aspect_ratio=paper_aspect_ratio,
+                                    max_critic_rounds=paper_max_critic_rounds,
+                                    model_name=paper_model_name or default_model,
+                                )
+                            )
+                            st.session_state["paper_batch_outputs"] = batch_outputs
+
+                            run_dir, metadata_path = persist_paper_run_outputs(
+                                paper_title=st.session_state.get("paper_title", "Untitled Paper"),
+                                source_file_name=st.session_state.get("paper_source_name", ""),
+                                approved_briefs=approved_briefs,
+                                batch_outputs=batch_outputs,
+                                generation_settings={
+                                    "exp_mode": paper_exp_mode,
+                                    "num_candidates": paper_num_candidates,
+                                    "aspect_ratio": paper_aspect_ratio,
+                                    "max_critic_rounds": paper_max_critic_rounds,
+                                    "retrieval_setting": "none",
+                                    "model_name": paper_model_name or default_model,
+                                },
+                            )
+                            st.session_state["paper_run_dir"] = str(run_dir)
+                            st.session_state["paper_metadata_path"] = str(metadata_path)
+                            st.success("Generation completed for approved briefs.")
+                        except Exception as e:
+                            st.error(f"Batch generation failed: {e}")
+
+        batch_outputs = st.session_state.get("paper_batch_outputs", [])
+        if batch_outputs:
+            st.divider()
+            st.markdown("## 🎨 Generated Figures from Uploaded Paper")
+            if st.session_state.get("paper_run_dir"):
+                st.info(f"Saved run folder: `{st.session_state['paper_run_dir']}`")
+
+            metadata_path = st.session_state.get("paper_metadata_path")
+            if metadata_path and Path(metadata_path).exists():
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    st.download_button(
+                        label="⬇️ Download Generation Metadata (JSON)",
+                        data=f.read(),
+                        file_name=Path(metadata_path).name,
+                        mime="application/json",
+                        key="paper_download_metadata",
+                    )
+
+            current_mode = st.session_state.get("paper_exp_mode", "demo_planner_critic")
+            for brief_idx, item in enumerate(batch_outputs):
+                brief = item["brief"]
+                results = item["results"]
+                st.markdown(f"### {brief_idx + 1}. {brief.get('title', 'Untitled Figure')}")
+                st.caption(brief.get("caption_final", ""))
+
+                num_cols = 3
+                for row_start in range(0, len(results), num_cols):
+                    cols = st.columns(num_cols)
+                    for col_idx in range(num_cols):
+                        result_idx = row_start + col_idx
+                        if result_idx >= len(results):
+                            continue
+                        with cols[col_idx]:
+                            display_candidate_result(
+                                results[result_idx],
+                                candidate_id=result_idx,
+                                exp_mode=current_mode,
+                                key_prefix=f"paper_{brief_idx}",
+                            )
 
 if __name__ == "__main__":
     main()
