@@ -35,6 +35,10 @@ import os
 
 import yaml
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load local environment variables from .env (if present).
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # Load config
 config_path = Path(__file__).parent.parent / "configs" / "model_config.yaml"
